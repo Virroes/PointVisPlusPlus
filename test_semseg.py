@@ -1,203 +1,252 @@
 """
-Author: Benny
-Date: Nov 2019
+Test script for PointVisPlusPlus visibility classification model.
+Loads a trained model and evaluates it on test data.
 """
 import argparse
 import os
-from data_utils.S3DISDataLoader import ScannetDatasetWholeScene
-from data_utils.indoor3d_util import g_label2color
-import torch
-import logging
-from pathlib import Path
 import sys
-import importlib
-from tqdm import tqdm
-import provider
+import torch
 import numpy as np
+import importlib
+from pathlib import Path
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from data_utils.VisDataLoader import VisDataSet
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+import seaborn as sns
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
 
-classes = ['ceiling', 'floor', 'wall', 'beam', 'column', 'window', 'door', 'table', 'chair', 'sofa', 'bookcase',
-           'board', 'clutter']
-class2label = {cls: i for i, cls in enumerate(classes)}
-seg_classes = class2label
-seg_label_to_cat = {}
-for i, cat in enumerate(seg_classes.keys()):
-    seg_label_to_cat[i] = cat
-
+def convert_numpy_types(obj):
+    """Convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    else:
+        return obj
+    
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 def parse_args():
-    '''PARAMETERS'''
-    parser = argparse.ArgumentParser('Model')
-    parser.add_argument('--batch_size', type=int, default=32, help='batch size in testing [default: 32]')
-    parser.add_argument('--gpu', type=str, default='0', help='specify gpu device')
-    parser.add_argument('--num_point', type=int, default=4096, help='point number [default: 4096]')
-    parser.add_argument('--log_dir', type=str, required=True, help='experiment root')
-    parser.add_argument('--visual', action='store_true', default=False, help='visualize result [default: False]')
-    parser.add_argument('--test_area', type=int, default=5, help='area for testing, option: 1-6 [default: 5]')
-    parser.add_argument('--num_votes', type=int, default=3, help='aggregate segmentation scores with voting [default: 5]')
+    parser = argparse.ArgumentParser('Testing')
+    parser.add_argument('--model', type=str, default='pointnet2_sem_seg_msg', help='model name')
+    parser.add_argument('--checkpoint_path', type=str, required=True, help='Model checkpoint path')
+    parser.add_argument('--test_dir', type=str, default='data/test/', help='Test data directory')
+    parser.add_argument('--batch_size', type=int, default=128, help='batch size for testing')
+    parser.add_argument('--gpu', type=str, default='0', help='GPU to use')
+    
+    # VisDataSet parameters
+    parser.add_argument('--k_neighbors', type=int, default=1024, help='Number of neighbors per point')
+    parser.add_argument('--use_spherical', type=str2bool, default=True, help='Use spherical coordinates')
+    parser.add_argument('--voxel_size', type=float, default=None, help='Voxel size for downsampling')
+    parser.add_argument('--max_samples_per_scene', type=int, default=None, help='Max samples per scene')
+    
+    # Output parameters
+    parser.add_argument('--out_dir', type=str, default='results', help='Output directory for results')
+    parser.add_argument('--visualize', type=str2bool, default=True, help='Generate visualization plots')
+    
     return parser.parse_args()
 
-
-def add_vote(vote_label_pool, point_idx, pred_label, weight):
-    B = pred_label.shape[0]
-    N = pred_label.shape[1]
-    for b in range(B):
-        for n in range(N):
-            if weight[b, n] != 0 and not np.isinf(weight[b, n]):
-                vote_label_pool[int(point_idx[b, n]), int(pred_label[b, n])] += 1
-    return vote_label_pool
-
-
-def main(args):
-    def log_string(str):
-        logger.info(str)
-        print(str)
-
-    '''HYPER PARAMETER'''
+def test(args):
+    # Set up environment
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    experiment_dir = 'log/sem_seg/' + args.log_dir
-    visual_dir = experiment_dir + '/visual/'
-    visual_dir = Path(visual_dir)
-    visual_dir.mkdir(exist_ok=True)
-
-    '''LOG'''
-    args = parse_args()
-    logger = logging.getLogger("Model")
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('%s/eval.txt' % experiment_dir)
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    log_string('PARAMETER ...')
-    log_string(args)
-
-    NUM_CLASSES = 13
-    BATCH_SIZE = args.batch_size
-    NUM_POINT = args.num_point
-
-    root = 'data/s3dis/stanford_indoor3d/'
-
-    TEST_DATASET_WHOLE_SCENE = ScannetDatasetWholeScene(root, split='test', test_area=args.test_area, block_points=NUM_POINT)
-    log_string("The number of test data is: %d" % len(TEST_DATASET_WHOLE_SCENE))
-
-    '''MODEL LOADING'''
-    model_name = os.listdir(experiment_dir + '/logs')[0].split('.')[0]
-    MODEL = importlib.import_module(model_name)
+    
+    # Create output directories
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Visibility classes (using the corrected ordering)
+    vis_classes = ['occluded', 'visible']
+    NUM_CLASSES = len(vis_classes)
+    
+    # Load test data
+    print(f"Loading test data from {args.test_dir}...")
+    TEST_DATASET = VisDataSet(
+        split='test',
+        data_dir=args.test_dir,
+        k_neighbors=args.k_neighbors,
+        use_spherical=args.use_spherical,
+        voxel_size=args.voxel_size,
+        max_samples_per_scene=args.max_samples_per_scene
+    )
+    
+    testDataLoader = torch.utils.data.DataLoader(
+        TEST_DATASET,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Load model
+    MODEL = importlib.import_module(args.model)
     classifier = MODEL.get_model(NUM_CLASSES).cuda()
-    checkpoint = torch.load(str(experiment_dir) + '/checkpoints/best_model.pth')
+    
+    # Load checkpoint
+    print(f"Loading model from {args.checkpoint_path}")
+    try:
+        # Try the safer approach first
+        torch.serialization.add_safe_globals(['numpy._core.multiarray.scalar'])
+        checkpoint = torch.load(args.checkpoint_path)
+    except Exception as e:
+        print(f"Warning: Couldn't load with weights_only=True. Trying legacy mode: {e}")
+        # Fall back to legacy mode (less secure but more compatible)
+        checkpoint = torch.load(args.checkpoint_path, weights_only=False)
+    
     classifier.load_state_dict(checkpoint['model_state_dict'])
     classifier = classifier.eval()
-
+    print(f"Model was trained for {checkpoint['epoch']} epochs, class_avg_iou: {checkpoint.get('class_avg_iou', 'N/A')}")
+    
+    # Testing
+    print("Running model inference...")
     with torch.no_grad():
-        scene_id = TEST_DATASET_WHOLE_SCENE.file_list
-        scene_id = [x[:-4] for x in scene_id]
-        num_batches = len(TEST_DATASET_WHOLE_SCENE)
-
+        total_correct = 0
+        total_seen = 0
         total_seen_class = [0 for _ in range(NUM_CLASSES)]
         total_correct_class = [0 for _ in range(NUM_CLASSES)]
         total_iou_deno_class = [0 for _ in range(NUM_CLASSES)]
-
-        log_string('---- EVALUATION WHOLE SCENE----')
-
-        for batch_idx in range(num_batches):
-            print("Inference [%d/%d] %s ..." % (batch_idx + 1, num_batches, scene_id[batch_idx]))
-            total_seen_class_tmp = [0 for _ in range(NUM_CLASSES)]
-            total_correct_class_tmp = [0 for _ in range(NUM_CLASSES)]
-            total_iou_deno_class_tmp = [0 for _ in range(NUM_CLASSES)]
-            if args.visual:
-                fout = open(os.path.join(visual_dir, scene_id[batch_idx] + '_pred.obj'), 'w')
-                fout_gt = open(os.path.join(visual_dir, scene_id[batch_idx] + '_gt.obj'), 'w')
-
-            whole_scene_data = TEST_DATASET_WHOLE_SCENE.scene_points_list[batch_idx]
-            whole_scene_label = TEST_DATASET_WHOLE_SCENE.semantic_labels_list[batch_idx]
-            vote_label_pool = np.zeros((whole_scene_label.shape[0], NUM_CLASSES))
-            for _ in tqdm(range(args.num_votes), total=args.num_votes):
-                scene_data, scene_label, scene_smpw, scene_point_index = TEST_DATASET_WHOLE_SCENE[batch_idx]
-                num_blocks = scene_data.shape[0]
-                s_batch_num = (num_blocks + BATCH_SIZE - 1) // BATCH_SIZE
-                batch_data = np.zeros((BATCH_SIZE, NUM_POINT, 9))
-
-                batch_label = np.zeros((BATCH_SIZE, NUM_POINT))
-                batch_point_index = np.zeros((BATCH_SIZE, NUM_POINT))
-                batch_smpw = np.zeros((BATCH_SIZE, NUM_POINT))
-
-                for sbatch in range(s_batch_num):
-                    start_idx = sbatch * BATCH_SIZE
-                    end_idx = min((sbatch + 1) * BATCH_SIZE, num_blocks)
-                    real_batch_size = end_idx - start_idx
-                    batch_data[0:real_batch_size, ...] = scene_data[start_idx:end_idx, ...]
-                    batch_label[0:real_batch_size, ...] = scene_label[start_idx:end_idx, ...]
-                    batch_point_index[0:real_batch_size, ...] = scene_point_index[start_idx:end_idx, ...]
-                    batch_smpw[0:real_batch_size, ...] = scene_smpw[start_idx:end_idx, ...]
-                    batch_data[:, :, 3:6] /= 1.0
-
-                    torch_data = torch.Tensor(batch_data)
-                    torch_data = torch_data.float().cuda()
-                    torch_data = torch_data.transpose(2, 1)
-                    seg_pred, _ = classifier(torch_data)
-                    batch_pred_label = seg_pred.contiguous().cpu().data.max(2)[1].numpy()
-
-                    vote_label_pool = add_vote(vote_label_pool, batch_point_index[0:real_batch_size, ...],
-                                               batch_pred_label[0:real_batch_size, ...],
-                                               batch_smpw[0:real_batch_size, ...])
-
-            pred_label = np.argmax(vote_label_pool, 1)
-
+        
+        # For detailed metrics
+        all_preds = []
+        all_targets = []
+        
+        for batch_id, (points, target) in enumerate(tqdm(testDataLoader)):
+            points = points.float().cuda()
+            target = target.long().cuda()
+            points = points.transpose(2, 1)  # [batch, features, npoints]
+            
+            # Forward pass
+            seg_pred, _ = classifier(points)
+            pred_val = seg_pred.contiguous().cpu().data.numpy()
+            pred_val = np.argmax(pred_val, 2)  # [batch_size, num_points]
+            
+            # Copy to CPU for evaluation
+            batch_label = target.cpu().data.numpy()
+            
+            # Compute metrics
+            correct = np.sum(pred_val == batch_label)
+            total_correct += correct
+            total_seen += points.size()[0] * points.size()[2]
+            
+            # Collect predictions and targets for detailed metrics
+            all_preds.extend(pred_val.flatten())
+            all_targets.extend(batch_label.flatten())
+            
+            # Per-class metrics
             for l in range(NUM_CLASSES):
-                total_seen_class_tmp[l] += np.sum((whole_scene_label == l))
-                total_correct_class_tmp[l] += np.sum((pred_label == l) & (whole_scene_label == l))
-                total_iou_deno_class_tmp[l] += np.sum(((pred_label == l) | (whole_scene_label == l)))
-                total_seen_class[l] += total_seen_class_tmp[l]
-                total_correct_class[l] += total_correct_class_tmp[l]
-                total_iou_deno_class[l] += total_iou_deno_class_tmp[l]
+                total_seen_class[l] += np.sum(batch_label == l)
+                total_correct_class[l] += np.sum((pred_val == l) & (batch_label == l))
+                total_iou_deno_class[l] += np.sum((pred_val == l) | (batch_label == l))
+        
+        # Convert to numpy arrays
+        all_preds = np.array(all_preds)
+        all_targets = np.array(all_targets)
+        
+        # Calculate overall metrics
+        accuracy = total_correct / float(total_seen)
+        iou_per_class = np.array(total_correct_class) / (np.array(total_iou_deno_class, dtype=float) + 1e-6)
+        mIoU = np.mean(iou_per_class)
+        
+        # Calculate precision, recall, F1
+        precision, recall, f1, _ = precision_recall_fscore_support(all_targets, all_preds, average=None)
+        
+        # Print results
+        print("\n===== RESULTS =====")
+        print(f"Overall Accuracy: {accuracy:.4f}")
+        print(f"Mean IoU: {mIoU:.4f}")
+        
+        print("\nPer-Class Performance:")
+        for i, cls_name in enumerate(vis_classes):
+            print(f"Class {i} ({cls_name}):")
+            print(f"  - IoU: {iou_per_class[i]:.4f}")
+            print(f"  - Precision: {precision[i]:.4f}")
+            print(f"  - Recall: {recall[i]:.4f}")
+            print(f"  - F1 Score: {f1[i]:.4f}")
+            print(f"  - Samples: {total_seen_class[i]}")
+        
+        # Confusion Matrix
+        cm = confusion_matrix(all_targets, all_preds)
+        print("\nConfusion Matrix:")
+        print(cm)
+        
+        # Save results
+        results = {
+            'accuracy': float(accuracy),
+            'mean_iou': float(mIoU),
+            'iou_per_class': iou_per_class.tolist(),
+            'precision': precision.tolist(),
+            'recall': recall.tolist(),
+            'f1_score': f1.tolist(),
+            'samples_per_class': [int(x) for x in total_seen_class],  # Convert to regular Python ints
+            'confusion_matrix': cm.tolist()
+        }
 
-            iou_map = np.array(total_correct_class_tmp) / (np.array(total_iou_deno_class_tmp, dtype=np.float) + 1e-6)
-            print(iou_map)
-            arr = np.array(total_seen_class_tmp)
-            tmp_iou = np.mean(iou_map[arr != 0])
-            log_string('Mean IoU of %s: %.4f' % (scene_id[batch_idx], tmp_iou))
-            print('----------------------------')
+        # Convert any remaining numpy types
+        results = convert_numpy_types(results)
 
-            filename = os.path.join(visual_dir, scene_id[batch_idx] + '.txt')
-            with open(filename, 'w') as pl_save:
-                for i in pred_label:
-                    pl_save.write(str(int(i)) + '\n')
-                pl_save.close()
-            for i in range(whole_scene_label.shape[0]):
-                color = g_label2color[pred_label[i]]
-                color_gt = g_label2color[whole_scene_label[i]]
-                if args.visual:
-                    fout.write('v %f %f %f %d %d %d\n' % (
-                        whole_scene_data[i, 0], whole_scene_data[i, 1], whole_scene_data[i, 2], color[0], color[1],
-                        color[2]))
-                    fout_gt.write(
-                        'v %f %f %f %d %d %d\n' % (
-                            whole_scene_data[i, 0], whole_scene_data[i, 1], whole_scene_data[i, 2], color_gt[0],
-                            color_gt[1], color_gt[2]))
-            if args.visual:
-                fout.close()
-                fout_gt.close()
-
-        IoU = np.array(total_correct_class) / (np.array(total_iou_deno_class, dtype=np.float) + 1e-6)
-        iou_per_class_str = '------- IoU --------\n'
-        for l in range(NUM_CLASSES):
-            iou_per_class_str += 'class %s, IoU: %.3f \n' % (
-                seg_label_to_cat[l] + ' ' * (14 - len(seg_label_to_cat[l])),
-                total_correct_class[l] / float(total_iou_deno_class[l]))
-        log_string(iou_per_class_str)
-        log_string('eval point avg class IoU: %f' % np.mean(IoU))
-        log_string('eval whole scene point avg class acc: %f' % (
-            np.mean(np.array(total_correct_class) / (np.array(total_seen_class, dtype=np.float) + 1e-6))))
-        log_string('eval whole scene point accuracy: %f' % (
-                np.sum(total_correct_class) / float(np.sum(total_seen_class) + 1e-6)))
-
-        print("Done!")
-
+        # Save metrics to file
+        import json
+        with open(out_dir / 'metrics.json', 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        # Visualizations
+        if args.visualize:
+            # Confusion matrix plot
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(cm, annot=True, fmt='d', xticklabels=vis_classes, yticklabels=vis_classes)
+            plt.title('Confusion Matrix')
+            plt.ylabel('True Label')
+            plt.xlabel('Predicted Label')
+            plt.tight_layout()
+            plt.savefig(out_dir / 'confusion_matrix.png')
+            
+            # Precision and Recall plot
+            plt.figure(figsize=(10, 6))
+            x = np.arange(len(vis_classes))
+            width = 0.35
+            plt.bar(x - width/2, precision, width, label='Precision')
+            plt.bar(x + width/2, recall, width, label='Recall')
+            plt.xlabel('Classes')
+            plt.ylabel('Score')
+            plt.title('Precision and Recall by Class')
+            plt.xticks(x, vis_classes)
+            plt.legend()
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.ylim(0, 1)
+            plt.tight_layout()
+            plt.savefig(out_dir / 'precision_recall.png')
+            
+            # IoU plot
+            plt.figure(figsize=(10, 6))
+            plt.bar(x, iou_per_class)
+            plt.xlabel('Classes')
+            plt.ylabel('IoU')
+            plt.title('IoU by Class')
+            plt.xticks(x, vis_classes)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.ylim(0, 1)
+            plt.tight_layout()
+            plt.savefig(out_dir / 'iou.png')
+            
+        print(f"Results saved to {out_dir}")
 
 if __name__ == '__main__':
     args = parse_args()
-    main(args)
+    test(args)
