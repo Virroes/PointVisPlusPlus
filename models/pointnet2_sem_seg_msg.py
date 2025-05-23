@@ -2,6 +2,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 from models.pointnet2_utils import PointNetSetAbstractionMsg,PointNetFeaturePropagation
+from torch.autograd import Variable
 
 
 class get_model(nn.Module):
@@ -42,45 +43,53 @@ class get_model(nn.Module):
         return x, l4_points
 
 
+
+
 class get_loss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=None):
+    def __init__(self, gamma=0, alpha=None, size_average=True):
         """Focal Loss for semantic segmentation.
         
         Args:
             gamma: focusing parameter for Focal Loss (default: 2.0)
             alpha: optional manual class weights
+            size_average: whether to average or sum loss
         """
         super(get_loss, self).__init__()
         self.gamma = gamma
         self.alpha = alpha
-        
-    def forward(self, pred, target, trans_feat, weight=None):
+        if isinstance(alpha,(float,int)): self.alpha = torch.Tensor([alpha,1-alpha])
+        if isinstance(alpha,list): self.alpha = torch.Tensor(alpha)
+        self.size_average = size_average
+
+    def forward(self, input, target, trans_feat=None, weight=None):
         """
         Args:
-            pred: [B*N, C] prediction logits
-            target: [B*N] ground truth labels
-            trans_feat: features for transformation regularization
-            weight: class weights
+            input: prediction logits
+            target: ground truth labels
+            trans_feat: feature transformation (unused but kept for interface compatibility)
+            weight: optional class weights that take precedence over self.alpha
         """
-        # Use provided weights or default to equal weights
-        alpha = weight if weight is not None else self.alpha
-        
-        # Convert log_softmax outputs to probabilities
-        pred_softmax = torch.exp(pred)
-        
-        # Get predicted probability for the target class
-        pt = pred_softmax.gather(1, target.unsqueeze(1)).squeeze(1)
-        
-        # Calculate focal weight
-        focal_weight = (1 - pt) ** self.gamma
-        
-        # Calculate Focal Loss
-        loss = -alpha[target] * focal_weight * pred.gather(1, target.unsqueeze(1)).squeeze(1)
-        
-        # Mean reduction
-        focal_loss = loss.mean()
-        
-        return focal_loss
+        if input.dim()>2:
+            input = input.view(input.size(0),input.size(1),-1)  # N,C,H,W => N,C,H*W
+            input = input.transpose(1,2)    # N,C,H*W => N,H*W,C
+            input = input.contiguous().view(-1,input.size(2))   # N,H*W,C => N*H*W,C
+        target = target.view(-1,1)
+
+        logpt = F.log_softmax(input, dim=1)
+        logpt = logpt.gather(1,target)
+        logpt = logpt.view(-1)
+        pt = Variable(logpt.data.exp())
+
+        if self.alpha is not None:
+            if self.alpha.type()!=input.data.type():
+                self.alpha = self.alpha.type_as(input.data)
+            at = self.alpha.gather(0,target.data.view(-1))
+            logpt = logpt * Variable(at)
+
+        loss = -1 * (1-pt)**self.gamma * logpt
+        if self.size_average: return loss.mean()
+        else: return loss.sum()
+    
 if __name__ == '__main__':
     import  torch
     model = get_model(13)

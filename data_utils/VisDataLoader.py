@@ -387,3 +387,74 @@ class VisDataSet(Dataset):
         weights = weights / weights.sum() * len(classes)
         
         return weights
+    
+    def save_debug_samples(self, num_samples=10, output_dir="debug_samples"):
+        """Save a subset of center points and their neighbors for debugging.
+        
+        Args:
+            num_samples: Number of samples to save (default: 10)
+            output_dir: Directory to save the debug samples
+        """
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Select random samples
+        if len(self) <= num_samples:
+            indices = list(range(len(self)))
+        else:
+            indices = self.rng.choice(len(self), size=num_samples, replace=False)
+        
+        print(f"Saving {len(indices)} debug samples to {output_dir}...")
+        
+        for i, idx in enumerate(indices):
+            # Get points and labels using __getitem__
+            points, labels = self[idx]
+            scene_idx, point_idx = self.all_indices[idx]
+            
+            # If we're using spherical coordinates, convert back to Cartesian
+            if self.use_spherical:
+                # Extract r, theta, phi
+                r = points[:, 0]
+                theta = points[:, 1]
+                phi = points[:, 2]
+                
+                # Convert to Cartesian
+                x = r * np.cos(phi) * np.cos(theta)
+                y = r * np.cos(phi) * np.sin(theta)
+                z = r * np.sin(phi)
+                
+                # Get u, v coordinates
+                u = points[:, 3]
+                v = points[:, 4]
+                
+                save_data = np.column_stack([x, y, z, u, v, labels])
+            else:
+                # Already in Cartesian format
+                save_data = np.column_stack([points, labels])
+            
+            # Save as XYZ file
+            filename = f"sample_{i}_scene_{scene_idx}_center_{point_idx}.xyz"
+            filepath = os.path.join(output_dir, filename)
+            
+            np.savetxt(
+                filepath,
+                save_data,
+                fmt="%.6f %.6f %.6f %.6f %.6f %d",
+                header=f"x y z u v label - Debug sample {i}, Scene {scene_idx}, Center point {point_idx}",
+                comments=""
+            )
+            
+            # Highlight center point in a separate file
+            center_point = save_data[0].reshape(1, -1)
+            center_filepath = os.path.join(output_dir, f"center_{i}_scene_{scene_idx}_point_{point_idx}.xyz")
+            np.savetxt(
+                center_filepath,
+                center_point,
+                fmt="%.6f %.6f %.6f %.6f %.6f %d",
+                header=f"x y z u v label - Center point for sample {i}, Scene {scene_idx}",
+                comments=""
+            )
+            
+            print(f"Saved {filepath} with {len(points)} points")
+        
+        print(f"Successfully saved {len(indices)} debug samples to {output_dir}")

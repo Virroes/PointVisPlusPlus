@@ -2,7 +2,7 @@
 Author: Benny
 Date: Nov 2019
 Modified: May 2023 - Added support for VisDataSet with spherical coordinates
-Modified: May 2025 - Added focal loss, precision/recall metrics, and enhanced visualization
+Modified: May 2025 - Added focal loss and binary classification metrics
 """
 import argparse
 import os
@@ -22,14 +22,14 @@ import numpy as np
 import time
 import matplotlib.pyplot as plt
 import pandas as pd  # Add pandas for CSV export
-from sklearn.metrics import precision_score, recall_score
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
 
-# Visibility classes - update these based on your actual classes
-vis_classes = ['occluded', 'visible']
+# Visibility classes - occluded=0, visible=1
+vis_classes = ['occluded', 'visible']  
 class2label = {cls: i for i, cls in enumerate(vis_classes)}
 seg_classes = class2label
 seg_label_to_cat = {}
@@ -54,7 +54,7 @@ def str2bool(v):
 def parse_args():
     parser = argparse.ArgumentParser('Model')
     parser.add_argument('--model', type=str, default='pointnet2_sem_seg_msg', help='model name')
-    parser.add_argument('--batch_size', type=int, default=128, help='Batch Size during training')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch Size during training')
     parser.add_argument('--epoch', default=100, type=int, help='Epoch to run')
     parser.add_argument('--learning_rate', default=0.001, type=float, help='Initial learning rate')
     parser.add_argument('--gpu', type=str, default='0', help='GPU to use')
@@ -68,7 +68,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility')
     parser.add_argument('--train_dir', type=str, default='data/train/', help='Directory with training data')
     parser.add_argument('--val_dir', type=str, default='data/val/', help='Directory with validation data')
-    parser.add_argument('--k_neighbors', type=int, default=1024, help='Number of neighbors per point')
+    parser.add_argument('--k_neighbors', type=int, default=4096, help='Number of neighbors per point')
     parser.add_argument('--use_spherical', type=str2bool, default=True,
                         help='Use spherical coordinates (r, theta, phi) instead of Cartesian (x, y, z)')
     parser.add_argument('--voxel_size', type=float, default=None,
@@ -127,6 +127,9 @@ def main(args):
 
     NUM_CLASSES = len(vis_classes)  # Number of visibility classes
     BATCH_SIZE = args.batch_size
+    POSITIVE_CLASS = 1  # 'visible' class is positive
+    
+    log_string(f"Using binary classification: Positive class={vis_classes[POSITIVE_CLASS]} (1), Negative class={vis_classes[1-POSITIVE_CLASS]} (0)")
 
     print("Start loading training data...")
     TRAIN_DATASET = VisDataSet(
@@ -138,6 +141,7 @@ def main(args):
         max_samples_per_scene=args.max_samples_per_scene,
         seed=args.seed
     )
+    TRAIN_DATASET.save_debug_samples(num_samples=10, output_dir="debug_point_clouds_train")
     
     print("Start loading val data...")
     VAL_DATASET = VisDataSet(
@@ -149,6 +153,7 @@ def main(args):
         max_samples_per_scene=args.max_samples_per_scene,
         seed=args.seed
     )
+    VAL_DATASET.save_debug_samples(num_samples=10, output_dir="debug_point_clouds_val")
 
     trainDataLoader = torch.utils.data.DataLoader(
         TRAIN_DATASET, 
@@ -158,8 +163,8 @@ def main(args):
         pin_memory=True, 
         drop_last=True,
         worker_init_fn=lambda x: np.random.seed(x + int(time.time())),
-        persistent_workers=True,  # Keep workers alive between iterations
-        prefetch_factor=3  # Prefetch batches
+        persistent_workers=True,
+        prefetch_factor=3
     )
     
     valDataLoader = torch.utils.data.DataLoader(
@@ -169,8 +174,8 @@ def main(args):
         num_workers=24,
         pin_memory=True, 
         drop_last=True,
-        persistent_workers=True,  # Keep workers alive between iterations
-        prefetch_factor=3  # Prefetch batches
+        persistent_workers=True,
+        prefetch_factor=3
     )
     
     # Get class weights for loss weighting
@@ -210,7 +215,7 @@ def main(args):
             torch.nn.init.constant_(m.bias.data, 0.0)
 
     try:
-        checkpoint = torch.load(str(experiment_dir) + '/checkpoints/best_model.pth')
+        checkpoint = torch.load(str(experiment_dir) + '/checkpoints/best_model.pth', weights_only=False)
         start_epoch = checkpoint['epoch']
         classifier.load_state_dict(checkpoint['model_state_dict'])
         log_string('Use pretrain model')
@@ -240,19 +245,17 @@ def main(args):
     MOMENTUM_DECCAY_STEP = args.step_size
 
     global_epoch = 0
-    best_iou = 0
+    best_accuracy = 0
     
     # Lists to store metrics
     train_losses = []
     train_accs = []
     val_losses = []
     val_accs = []
-    val_ious = []
+    val_precisions = []
+    val_recalls = []
+    val_f1s = []
     epochs = []
-    
-    # Lists to store precision and recall per class
-    precisions = {i: [] for i in range(NUM_CLASSES)}
-    recalls = {i: [] for i in range(NUM_CLASSES)}
 
     for epoch in range(start_epoch, args.epoch):
         '''Train on point-centered neighborhoods'''
@@ -271,6 +274,8 @@ def main(args):
         total_seen = 0
         loss_sum = 0
         classifier = classifier.train()
+        # For collecting all training labels
+        all_train_targets = []
 
         for i, (points, target) in tqdm(enumerate(trainDataLoader), total=len(trainDataLoader), smoothing=0.9):
             optimizer.zero_grad()
@@ -296,14 +301,11 @@ def main(args):
             pred_choice = seg_pred.cpu().data.max(1)[1].numpy()
             correct = np.sum(pred_choice == batch_label)
             total_correct += correct
-            total_seen += (BATCH_SIZE * args.k_neighbors)  # Use k_neighbors instead of NUM_POINT
+            total_seen += (BATCH_SIZE * args.k_neighbors)
             loss_sum += loss.item()
-            
-            """if i % 10 == 0:
-                write('batch %03d loss: %f acc: %f' % (i, loss, correct / float(BATCH_SIZE * args.k_neighbors)))
-                log_batch_stats(batch_label, "Train")"""
+            # Collect all training labels
+            all_train_targets.extend(batch_label)
                 
-        
         # Calculate train metrics for this epoch
         train_loss = loss_sum / num_batches
         train_acc = total_correct / float(total_seen)
@@ -334,12 +336,9 @@ def main(args):
             total_seen = 0
             loss_sum = 0
             labelweights = np.zeros(NUM_CLASSES)
-            total_seen_class = [0 for _ in range(NUM_CLASSES)]
-            total_correct_class = [0 for _ in range(NUM_CLASSES)]
-            total_iou_deno_class = [0 for _ in range(NUM_CLASSES)]
             classifier = classifier.eval()
             
-            # For precision and recall calculation
+            # For binary metrics calculation
             all_preds = []
             all_targets = []
 
@@ -360,69 +359,50 @@ def main(args):
                 pred_val = np.argmax(pred_val, 2)
                 correct = np.sum((pred_val == batch_label))
                 total_correct += correct
-                total_seen += (BATCH_SIZE * args.k_neighbors)  # Use k_neighbors instead of NUM_POINT
+                total_seen += (BATCH_SIZE * args.k_neighbors)
+                
                 tmp, _ = np.histogram(batch_label, range(NUM_CLASSES + 1))
                 labelweights += tmp
 
-                # Collect all predictions and targets for precision/recall
+                # Collect all predictions and targets for binary metrics
                 all_preds.extend(pred_val.flatten())
                 all_targets.extend(batch_label.flatten())
 
-                for l in range(NUM_CLASSES):
-                    total_seen_class[l] += np.sum((batch_label == l))
-                    total_correct_class[l] += np.sum((pred_val == l) & (batch_label == l))
-                    total_iou_deno_class[l] += np.sum(((pred_val == l) | (batch_label == l)))
-                
-                """if i % 50 == 0:  # Log every 50 batches
-                    write('batch %03d loss: %f acc: %f' % (i, loss, correct / float(BATCH_SIZE * args.k_neighbors)))
-                    log_batch_stats(batch_label, "val")"""
-
             # Calculate overall metrics
             labelweights = labelweights.astype(np.float32) / np.sum(labelweights.astype(np.float32))
-            mIoU = np.mean(np.array(total_correct_class) / (np.array(total_iou_deno_class, dtype=float) + 1e-6))
             val_loss = loss_sum / float(num_batches)
             val_acc = total_correct / float(total_seen)
-            
-            # Calculate precision and recall for each class
-            class_precision = []
-            class_recall = []
             
             # Convert to numpy arrays
             all_preds = np.array(all_preds)
             all_targets = np.array(all_targets)
             
-            for i in range(NUM_CLASSES):
-                # True positives: prediction == i and target == i
-                true_pos = np.sum((all_preds == i) & (all_targets == i))
-                # All predicted as class i
-                total_pred_i = np.sum(all_preds == i)
-                # All actual class i
-                total_class_i = np.sum(all_targets == i)
-                
-                # Calculate precision and recall
-                prec = true_pos / max(total_pred_i, 1)  # avoid division by zero
-                rec = true_pos / max(total_class_i, 1)  # avoid division by zero
-                
-                class_precision.append(prec)
-                class_recall.append(rec)
-                
-                # Store for plotting
-                precisions[i].append(prec)
-                recalls[i].append(rec)
-                
-                log_string(f'Class {i} ({seg_label_to_cat[i]}): Precision={prec:.4f}, Recall={rec:.4f}')
+            # Calculate binary metrics for the positive class (visible=1)
+            precision = precision_score(all_targets, all_preds, pos_label=POSITIVE_CLASS)
+            recall = recall_score(all_targets, all_preds, pos_label=POSITIVE_CLASS)
+            f1 = f1_score(all_targets, all_preds, pos_label=POSITIVE_CLASS)
+            
+            log_string(f'Binary classification metrics for {vis_classes[POSITIVE_CLASS]} class:')
+            log_string(f'  - Precision: {precision:.4f}')
+            log_string(f'  - Recall: {recall:.4f}')
+            log_string(f'  - F1 Score: {f1:.4f}')
+            
+            # Log class distribution
+            class_dist = np.bincount(all_targets.astype(int))
+            pred_dist = np.bincount(all_preds.astype(int))
+            log_string(f'Class distribution in validation data: {dict(enumerate(class_dist))}')
+            log_string(f'Predicted class distribution: {dict(enumerate(pred_dist))}')
             
             # Log evaluation metrics
-            log_string('eval mean loss: %f' % val_loss)
-            log_string('eval point avg class IoU: %f' % mIoU)
-            log_string('eval point accuracy: %f' % val_acc)
-            log_string('eval point avg class acc: %f' % (
-                np.mean(np.array(total_correct_class) / (np.array(total_seen_class, dtype=float) + 1e-6))))
+            log_string('Eval mean loss: %f' % val_loss)
+            log_string('Eval accuracy: %f' % val_acc)
 
             # Store validation metrics
             val_losses.append(val_loss)
             val_accs.append(val_acc)
-            val_ious.append(mIoU)
+            val_precisions.append(precision)
+            val_recalls.append(recall)
+            val_f1s.append(f1)
             epochs.append(epoch)
             
             # Create metrics dataframe
@@ -432,18 +412,15 @@ def main(args):
                 'train_accuracy': train_accs,
                 'val_loss': val_losses,
                 'val_accuracy': val_accs,
-                'val_iou': val_ious
+                'val_precision': val_precisions,
+                'val_recall': val_recalls,
+                'val_f1': val_f1s
             })
-            
-            # Add precision and recall for each class
-            for i in range(NUM_CLASSES):
-                metrics_df[f'precision_class_{i}'] = precisions[i]
-                metrics_df[f'recall_class_{i}'] = recalls[i]
             
             # Save metrics as CSV
             metrics_df.to_csv(f"{metrics_dir}/training_metrics.csv", index=False)
             
-            # Create separate plots for different metrics
+            # Create plots for different metrics
             
             # 1. Loss plot
             plt.figure(figsize=(10, 6))
@@ -469,68 +446,62 @@ def main(args):
             plt.savefig(f"{plots_dir}/accuracy.png")
             plt.close()
             
-            # 3. IoU plot
+            # 3. Binary metrics plot
             plt.figure(figsize=(10, 6))
-            plt.plot(epochs, val_ious, '-o', label='Validation IoU')
-            plt.title('IoU vs. Epochs')
+            plt.plot(epochs, val_precisions, '-o', label='Precision')
+            plt.plot(epochs, val_recalls, '-o', label='Recall')
+            plt.plot(epochs, val_f1s, '-o', label='F1 Score')
+            plt.title(f'Binary Metrics for {vis_classes[POSITIVE_CLASS]} Class')
             plt.xlabel('Epochs')
-            plt.ylabel('IoU')
+            plt.ylabel('Score')
             plt.legend()
             plt.grid(True)
-            plt.savefig(f"{plots_dir}/iou.png")
+            plt.ylim(0, 1)
+            plt.savefig(f"{plots_dir}/binary_metrics.png")
             plt.close()
+
+            # Save class distributions to CSV
+            train_class_dist = np.bincount(np.array(all_train_targets).astype(int))
+            val_class_dist = class_dist
+            val_pred_dist = pred_dist
             
-            # 4. Precision plot
-            plt.figure(figsize=(10, 6))
-            for i in range(NUM_CLASSES):
-                plt.plot(epochs, precisions[i], '-o', label=f'{seg_label_to_cat[i]}')
-            plt.title('Precision vs. Epochs')
-            plt.xlabel('Epochs')
-            plt.ylabel('Precision')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(f"{plots_dir}/precision.png")
-            plt.close()
+            # Create distribution dataframe
+            dist_data = {
+                'class': list(vis_classes),
+                'train_count': [train_class_dist[i] if i < len(train_class_dist) else 0 for i in range(NUM_CLASSES)],
+                'train_percent': [100 * train_class_dist[i] / sum(train_class_dist) if i < len(train_class_dist) else 0 for i in range(NUM_CLASSES)],
+                'val_count': [val_class_dist[i] if i < len(val_class_dist) else 0 for i in range(NUM_CLASSES)],
+                'val_percent': [100 * val_class_dist[i] / sum(val_class_dist) if i < len(val_class_dist) else 0 for i in range(NUM_CLASSES)],
+                'val_pred_count': [val_pred_dist[i] if i < len(val_pred_dist) else 0 for i in range(NUM_CLASSES)],
+                'val_pred_percent': [100 * val_pred_dist[i] / sum(val_pred_dist) if i < len(val_pred_dist) else 0 for i in range(NUM_CLASSES)]
+            }
             
-            # 5. Recall plot
-            plt.figure(figsize=(10, 6))
-            for i in range(NUM_CLASSES):
-                plt.plot(epochs, recalls[i], '-o', label=f'{seg_label_to_cat[i]}')
-            plt.title('Recall vs. Epochs')
-            plt.xlabel('Epochs')
-            plt.ylabel('Recall')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(f"{plots_dir}/recall.png")
-            plt.close()
 
-            # Print IoU per class
-            iou_per_class_str = '------- IoU --------\n'
-            for l in range(NUM_CLASSES):
-                iou_per_class_str += 'class %s weight: %.3f, IoU: %.3f \n' % (
-                    seg_label_to_cat[l] + ' ' * (14 - len(seg_label_to_cat[l])), 
-                    labelweights[l] if l < len(labelweights) else 0,
-                    total_correct_class[l] / float(total_iou_deno_class[l])
-                )
-
-            log_string(iou_per_class_str)
-            log_string('Eval mean loss: %f' % val_loss)
-            log_string('Eval accuracy: %f' % val_acc)
-
-            if mIoU >= best_iou:
-                best_iou = mIoU
+            
+            # Also save latest distribution as a separate file for easy access
+            pd.DataFrame(dist_data).to_csv(f"{metrics_dir}/latest_class_distribution.csv", index=False)
+            
+            log_string(f"Class distribution saved to {metrics_dir}/class_distribution_epoch_{epoch}.csv")
+            
+            
+            # Save model if we have better accuracy
+            if val_acc >= best_accuracy:
+                best_accuracy = val_acc
                 logger.info('Save model...')
                 savepath = str(checkpoints_dir) + '/best_model.pth'
                 log_string('Saving at %s' % savepath)
                 state = {
                     'epoch': epoch,
-                    'class_avg_iou': mIoU,
+                    'accuracy': val_acc,
+                    'precision': precision,
+                    'recall': recall,
+                    'f1': f1,
                     'model_state_dict': classifier.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }
                 torch.save(state, savepath)
                 log_string('Saving model....')
-            log_string('Best mIoU: %f' % best_iou)
+            log_string('Best accuracy: %f' % best_accuracy)
         global_epoch += 1
 
 if __name__ == '__main__':
